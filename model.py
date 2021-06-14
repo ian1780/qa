@@ -78,7 +78,7 @@ def setup_model():
   return model
 
 def train(model):
-  model.train
+  model.train()
   pass
 
 def validate():
