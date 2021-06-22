@@ -6,7 +6,7 @@ import argparse
 
 from pathlib import Path
 from torch.utils.data import DataLoader
-from transformers import AdamW, BertPreTrainedModel, DistilBertModel
+from transformers import AdamW, BertPreTrainedModel, DistilBertModel, DistilBertTokenizerFast
 
 def parse_args():
   parser = argparse.ArgumentParser(description='model.py')
@@ -42,6 +42,16 @@ def parse_args():
 
   return args
 
+class Dataset(torch.utils.data.Dataset):
+  def __init__(self, encodings):
+    self.encodings = encodings
+
+  def __getitem__(self, idx):
+    return {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+
+  def __len__(self):
+    return len(self.encodings.input_ids)
+
 class Model(BertPreTrainedModel):
   def __init__(self, config):
     super(Model, self).__init__(config)
@@ -69,16 +79,64 @@ def read_squad(data_path):
 
   return contexts, questions, answers
 
-def preprocess(train_path):
-  contexts, questions, answers = read_squad(train_path)
+def add_end_idx(answers, contexts):
+  for answer, context in zip(answers, contexts):
+    gold_text = answer['text']
+    start_idx = answer['answer_start']
+    end_idx = start_idx + len(gold_text)
+
+    # sometimes squad answers are off by a character or two – fix this
+    if context[start_idx:end_idx] == gold_text:
+      answer['answer_end'] = end_idx
+    elif context[start_idx-1:end_idx-1] == gold_text:
+      answer['answer_start'] = start_idx - 1
+      answer['answer_end'] = end_idx - 1     # When the gold label is off by one character
+    elif context[start_idx-2:end_idx-2] == gold_text:
+      answer['answer_start'] = start_idx - 2
+      answer['answer_end'] = end_idx - 2     # When the gold label is off by two characters
+
+def add_token_positions(encodings, answers):
+  start_positions = []
+  end_positions = []
+  for i in range(len(answers)):
+    start_positions.append(encodings.char_to_token(i, answers[i]['answer_start']))
+    end_positions.append(encodings.char_to_token(i, answers[i]['answer_end'] - 1))
+
+    # if start position is None, the answer passage has been truncated
+    if start_positions[-1] is None:
+      start_positions[-1] = tokenizer.model_max_length
+    if end_positions[-1] is None:
+      end_positions[-1] = tokenizer.model_max_length
+
+  encodings.update({'start_positions': start_positions, 'end_positions': end_positions})
+
+def preprocess(train_path, dev_path, tokenizer):
+  train_contexts, train_questions, train_answers = read_squad(train_path)
+  dev_contexts, dev_questions, dev_answers = read_squad(dev_path)
+
+  add_end_idx(train_answers, train_contexts)
+  add_end_idx(dev_answers, dev_contexts)
+
+  train_encodings = tokenizer(train_contexts, train_questions, truncation=True, padding=True)
+  dev_encodings = tokenizer(dev_contexts, dev_questions, truncation=True, padding=True)
+
+  add_token_positions(train_encodings, train_answers)
+  add_token_positions(dev_encodings, dev_answers)
+
+  return train_encodings, dev_encodings
 
 def setup_model():
+  tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
   model = Model.from_pretrained('distilbert-base-uncased')
-
-  return model
+  
+  return tokenizer, model
 
 def train(model):
+  device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+  model.to(device)
+
   model.train()
+  train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
   pass
 
 def validate():
@@ -87,11 +145,10 @@ def validate():
 if __name__ == '__main__':
   args = parse_args()
 
-  train_contexts, train_questions, train_answers = preprocess(args.train_path)
-  dev_contexts, dev_questions, dev_answers = preprocess(args.dev_path)
+  tokenizer, model = setup_model()
 
-  model = setup_model()
+  train_encodings, dev_encodings = preprocess(args.train_path, args.dev_path, tokenizer)
+  train_dataset = Dataset(train_encodings)
+  dev_dataset = Dataset(dev_encodings)
   
   model = train(model)
-
-
